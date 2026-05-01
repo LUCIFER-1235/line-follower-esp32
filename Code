@@ -1,0 +1,596 @@
+// << full sketch with loop-escape logic >>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- USER PIN MAPPING (kept from original) ----------
+const int PWMA = 13;   // TB6612 PWM A
+const int AIN1 = 19;
+const int AIN2 = 18;
+
+const int PWMB = 4;    // TB6612 PWM B
+const int BIN1 = 17;
+const int BIN2 = 16;
+
+const int STBY = 5;    // TB6612 standby (HIGH to enable)
+
+// IR sensors right->left (kept original mapping)
+const int irPins[8] = {14,27,26,25,33,32,35,34};
+// SENSING: HIGH on black (LED on), LOW on white (LED off)
+
+// OLED Display (from provided logic)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------- PWM SETTINGS (software) ----------
+const unsigned long PWM_PERIOD_MS = 10; // 100 Hz
+volatile int dutyA = 0;
+volatile int dutyB = 0;
+
+// ---------- Limits & tuning (faster, crisp pivots) ----------
+const int MAX_DUTY = 150;    // limited for safe testing
+const int START_DUTY = 45;   // slightly higher initial ramp
+const int BASE_DUTY = 80;    // ~15% faster than 70
+const int ACCEL_STEP = 8;    // larger step -> faster ramp
+const unsigned long ACCEL_STEP_DELAY_MS = 15;
+
+const int BASE_SPEED = BASE_DUTY;         // reuse
+const int TURN_SPEED = 100;               // increased turning duty for authoritative pivots
+#define JUNCTION_TURN_MAX_DUR 1200UL    // ms
+#define DEAD_END_TIMEOUT 1200UL         // ms
+#define RECOVERY_FORWARD_SPEED 40      // small alignment speed
+#define RECOVERY_FORWARD_DUR 150       // ms
+#define DEAD_END_REVERSE_SPEED 70      // reverse duty
+#define DEAD_END_REVERSE_DUR 600       // ms
+const float maxSpeedMPS = 1.38f;
+
+// Junction parameters
+const int JUNCTION_SPEED = max(8, (int)(BASE_SPEED / 3.0f)); // slower at junctions
+
+// ---------- Sensor filtering parameters (fast but robust) ----------
+const uint8_t FILTER_LEN = 3;   // sliding window length (number of loop updates)
+const uint8_t FILTER_ACTIVATE_THRESHOLD = 2; // require >=2/3 readings to consider sensor active
+uint8_t sensorCounters[8];      // counters for digital filtering
+
+// ---------- Junction memory (simple runtime memory) ----------
+struct JunctionRecord {
+  uint32_t id;
+  uint8_t sig;         // signature = 8-bit sensor mask for junction matching
+  uint8_t failedMask;  // bit0 = left failed, bit1 = straight failed, bit2 = right failed
+  unsigned long ts;    // timestamp when record created/last updated
+  int lastAttempt;     // last attempted branch (-1,0,1) for convenience
+};
+JunctionRecord junctionRecords[32];
+int junctionRecordCount = 0;
+uint32_t junctionCounter = 1;
+uint32_t lastJunctionId = 0;    // id of most recently seen junction
+int lastAttemptChoice = 123;    // -1/0/1 sentinel when a branch was attempted
+
+// loop detection window (if same junction signature reappears within this many ms -> treat as loop)
+const unsigned long LOOP_RETURN_MS = 15000UL; // 15 seconds (tweakable)
+
+// ---------- Internal state ----------
+int sensorState[8];            // stable states after filtering (0/1)
+uint8_t lastSensorMask = 0;
+unsigned long pwmSliceStart = 0;
+bool outA = false;
+bool outB = false;
+
+// keep track of last time a (stable) line was seen
+unsigned long lastLineTime = 0;
+
+// turning flag: when true, do not wiggle (kept for future compatibility)
+volatile bool inTurning = false;
+
+// track actual duty to ramp smoothly
+int currentDutyA = 0;
+int currentDutyB = 0;
+
+// ---------- PWM core (software) ----------
+void pwmUpdate();
+void waitWithPWM(unsigned long ms);
+
+void pwmUpdate() {
+  unsigned long now = millis();
+  if (pwmSliceStart == 0) pwmSliceStart = now;
+  if (now - pwmSliceStart >= PWM_PERIOD_MS) {
+    pwmSliceStart += PWM_PERIOD_MS * ((now - pwmSliceStart) / PWM_PERIOD_MS);
+    outA = (dutyA > 0);
+    outB = (dutyB > 0);
+    digitalWrite(PWMA, outA ? HIGH : LOW);
+    digitalWrite(PWMB, outB ? HIGH : LOW);
+  } else {
+    unsigned long elapsed = now - pwmSliceStart;
+    unsigned long onA = (unsigned long)((uint32_t)dutyA * PWM_PERIOD_MS / 255);
+    unsigned long onB = (unsigned long)((uint32_t)dutyB * PWM_PERIOD_MS / 255);
+    if (outA && elapsed >= onA) { outA = false; digitalWrite(PWMA, LOW); }
+    if (outB && elapsed >= onB) { outB = false; digitalWrite(PWMB, LOW); }
+  }
+}
+
+void waitWithPWM(unsigned long ms) {
+  unsigned long end = millis() + ms;
+  while (millis() < end) {
+    pwmUpdate();
+    delay(1);
+  }
+}
+
+// ---------- Motor low-level ----------
+void motorASetDirection(bool forward) {
+  if (forward) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); }
+  else         { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); }
+}
+void motorBSetDirection(bool forward) {
+  if (forward) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); }
+  else         { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); }
+}
+
+// direct set (keeps using PWM core)
+void setDutyA(int d) { dutyA = constrain(d, 0, MAX_DUTY); pwmUpdate(); }
+void setDutyB(int d) { dutyB = constrain(d, 0, MAX_DUTY); pwmUpdate(); }
+
+void stopMotors() {
+  setDutyA(0); setDutyB(0);
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+  digitalWrite(PWMA, LOW); digitalWrite(PWMB, LOW);
+  currentDutyA = 0; currentDutyB = 0;
+}
+void driveStop() { stopMotors(); }
+
+// ---------- Smooth ramp helper (faster) ----------
+void rampTo(int targetA, int targetB, int step = ACCEL_STEP, unsigned long stepDelayMs = 6) {
+  targetA = constrain(targetA, 0, MAX_DUTY);
+  targetB = constrain(targetB, 0, MAX_DUTY);
+  while (currentDutyA != targetA || currentDutyB != targetB) {
+    if (currentDutyA < targetA) currentDutyA = min(targetA, currentDutyA + step);
+    else if (currentDutyA > targetA) currentDutyA = max(targetA, currentDutyA - step);
+
+    if (currentDutyB < targetB) currentDutyB = min(targetB, currentDutyB + step);
+    else if (currentDutyB > targetB) currentDutyB = max(targetB, currentDutyB - step);
+
+    setDutyA(currentDutyA);
+    setDutyB(currentDutyB);
+    // keep PWM alive
+    pwmUpdate();
+    delay(stepDelayMs);
+  }
+}
+
+// ---------- Immediate pivot helpers (for quick turns) ----------
+void immediatePivotLeft(int speed) {
+  // Stop left motor, run right motor forward immediately
+  motorASetDirection(true);
+  motorBSetDirection(true);
+  currentDutyA = 0;
+  currentDutyB = constrain(speed, 0, MAX_DUTY);
+  setDutyA(0);
+  setDutyB(currentDutyB);
+}
+
+void immediatePivotRight(int speed) {
+  motorASetDirection(true);
+  motorBSetDirection(true);
+  currentDutyB = 0;
+  currentDutyA = constrain(speed, 0, MAX_DUTY);
+  setDutyA(currentDutyA);
+  setDutyB(0);
+}
+
+// ---------- Sensors with digital filtering ----------
+uint8_t readRawSensorsMask() {
+  uint8_t mask = 0;
+  for (int i = 0; i < 8; ++i) {
+    int v = digitalRead(irPins[i]);
+    bool onLine = (v == HIGH);
+    if (onLine) mask |= (1 << i);
+  }
+  return mask;
+}
+
+uint8_t readSensorsFiltered() {
+  // read raw once
+  uint8_t raw = readRawSensorsMask();
+
+  // update sliding counters (simple up/down)
+  for (int i = 0; i < 8; ++i) {
+    bool rawOn = (raw & (1 << i)) != 0;
+    if (rawOn) {
+      if (sensorCounters[i] < FILTER_LEN) sensorCounters[i]++;
+    } else {
+      if (sensorCounters[i] > 0) sensorCounters[i]--;
+    }
+    // stable decision
+    sensorState[i] = (sensorCounters[i] >= FILTER_ACTIVATE_THRESHOLD) ? 1 : 0;
+  }
+
+  // create stable mask from sensorState[] and update lastSensorMask/time
+  uint8_t stableMask = 0;
+  for (int i = 0; i < 8; ++i) if (sensorState[i]) stableMask |= (1 << i);
+
+  lastSensorMask = stableMask;
+  if (stableMask != 0) lastLineTime = millis();
+  return stableMask;
+}
+
+bool anySensorActiveFiltered() {
+  uint8_t m = readSensorsFiltered();
+  return m != 0;
+}
+
+// ---------- Junction memory helpers ----------
+
+// find index for a given id, -1 if not found
+int findJunctionIndexById(uint32_t id) {
+  for (int i = 0; i < junctionRecordCount; ++i) {
+    if (junctionRecords[i].id == id) return i;
+  }
+  return -1;
+}
+
+// find index for a signature, -1 if not found
+int findJunctionIndexBySig(uint8_t sig) {
+  for (int i = 0; i < junctionRecordCount; ++i) {
+    if (junctionRecords[i].sig == sig) return i;
+  }
+  return -1;
+}
+
+// create a new junction record and set lastJunctionId (stores signature)
+uint32_t createJunctionRecordWithSig(uint8_t sig) {
+  if (junctionRecordCount >= 32) {
+    // rotate oldest if full (overwrite)
+    int idx = junctionRecordCount % 32;
+    junctionRecords[idx].id = junctionCounter++;
+    junctionRecords[idx].sig = sig;
+    junctionRecords[idx].failedMask = 0;
+    junctionRecords[idx].ts = millis();
+    junctionRecords[idx].lastAttempt = 123;
+    lastJunctionId = junctionRecords[idx].id;
+    // increment count only until it reaches 32 to keep circular fill logic simple
+    if (junctionRecordCount < 32) junctionRecordCount++;
+    return lastJunctionId;
+  } else {
+    junctionRecords[junctionRecordCount].id = junctionCounter++;
+    junctionRecords[junctionRecordCount].sig = sig;
+    junctionRecords[junctionRecordCount].failedMask = 0;
+    junctionRecords[junctionRecordCount].ts = millis();
+    junctionRecords[junctionRecordCount].lastAttempt = 123;
+    lastJunctionId = junctionRecords[junctionRecordCount].id;
+    junctionRecordCount++;
+    return lastJunctionId;
+  }
+}
+
+// mark a branch failed for a junction id (-1 left, 0 straight, 1 right)
+void markJunctionBranchFailed(uint32_t id, int branch) {
+  if (id == 0) return;
+  int idx = findJunctionIndexById(id);
+  if (idx < 0) return;
+  uint8_t bit = 0;
+  if (branch == -1) bit = 1 << 0;
+  else if (branch == 0) bit = 1 << 1;
+  else if (branch == 1) bit = 1 << 2;
+  junctionRecords[idx].failedMask |= bit;
+  junctionRecords[idx].ts = millis();
+  Serial.print("Marked junction ");
+  Serial.print(id);
+  Serial.print(" failed branch ");
+  Serial.println(branch);
+}
+
+// choose branch at junction using memory (returns -1,0,1)
+int chooseBranchForJunction(uint8_t mask) {
+  // Ensure there's a record for the current junction
+  if (lastJunctionId == 0) createJunctionRecordWithSig(mask);
+
+  int idx = findJunctionIndexById(lastJunctionId);
+  uint8_t failed = 0;
+  if (idx >= 0) failed = junctionRecords[idx].failedMask;
+
+  // detect availability
+  bool leftAvail = (mask & ((1<<5)|(1<<6)|(1<<7)));
+  bool straightAvail = (mask & ((1<<3)|(1<<4)));
+  bool rightAvail = (mask & ((1<<0)|(1<<1)|(1<<2)));
+
+  // preferred default order: left, straight, right (keeps original priority)
+  int order[3] = {-1, 0, 1};
+  // try to pick first available & not failed
+  for (int i = 0; i < 3; ++i) {
+    int choice = order[i];
+    bool avail = (choice == -1) ? leftAvail : (choice == 0) ? straightAvail : rightAvail;
+    bool isFailed = false;
+    if (choice == -1) isFailed = (failed & (1<<0));
+    else if (choice == 0) isFailed = (failed & (1<<1));
+    else if (choice == 1) isFailed = (failed & (1<<2));
+    if (avail && !isFailed) {
+      if (idx >= 0) junctionRecords[idx].lastAttempt = choice;
+      lastAttemptChoice = choice;
+      return choice;
+    }
+  }
+  // if all available choices are failed, pick the first available (accept risk)
+  for (int i = 0; i < 3; ++i) {
+    int choice = order[i];
+    bool avail = (choice == -1) ? leftAvail : (choice == 0) ? straightAvail : rightAvail;
+    if (avail) {
+      if (idx >= 0) junctionRecords[idx].lastAttempt = choice;
+      lastAttemptChoice = choice;
+      return choice;
+    }
+  }
+  // fallback: if none available, go straight by default
+  if (idx >= 0) junctionRecords[idx].lastAttempt = 0;
+  lastAttemptChoice = 0;
+  return 0;
+}
+
+// Called when we detect a junction — creates/refreshes record (if new) and stores id.
+// NEW: checks for loop-return by comparing signature and timestamp.
+void markJunctionMemory(uint8_t mask) {
+  uint8_t sig = mask & 0xFF;
+
+  int idx = findJunctionIndexBySig(sig);
+  if (idx >= 0) {
+    // We saw this signature previously
+    unsigned long age = millis() - junctionRecords[idx].ts;
+    // If the same signature reappears within LOOP_RETURN_MS, treat it as a loop return
+    if (age <= LOOP_RETURN_MS) {
+      Serial.print("Loop-detect: revisited junction sig=0x");
+      Serial.print(sig, HEX);
+      Serial.print(" id=");
+      Serial.print(junctionRecords[idx].id);
+      Serial.print(" age=");
+      Serial.println(age);
+
+      // If we previously attempted a branch here, mark that branch failed,
+      // because it apparently led back to this same junction.
+      if (junctionRecords[idx].lastAttempt != 123) {
+        markJunctionBranchFailed(junctionRecords[idx].id, junctionRecords[idx].lastAttempt);
+        // clear lastAttempt to avoid repeated immediate marking
+        junctionRecords[idx].lastAttempt = 123;
+      }
+      // refresh timestamp and set as lastJunction
+      junctionRecords[idx].ts = millis();
+      lastJunctionId = junctionRecords[idx].id;
+      return;
+    } else {
+      // old, just refresh timestamp and use existing record
+      junctionRecords[idx].ts = millis();
+      lastJunctionId = junctionRecords[idx].id;
+      return;
+    }
+  } else {
+    // create new record with this signature
+    createJunctionRecordWithSig(sig);
+    Serial.print("New junction sig=0x");
+    Serial.print(sig, HEX);
+    Serial.print(" assigned id=");
+    Serial.println(lastJunctionId);
+    return;
+  }
+}
+
+// ---------- Movement helpers ----------
+void moveForward(int speedA, int speedB) {
+  motorASetDirection(true);
+  motorBSetDirection(true);
+  rampTo(speedA, speedB);
+}
+void moveBackward(int speedA, int speedB) {
+  motorASetDirection(false);
+  motorBSetDirection(false);
+  rampTo(speedA, speedB);
+}
+void sharpTurnLeft(int speed) {
+  // Smooth pivot: ramp left motor to 0, ramp right motor to 'speed'
+  motorASetDirection(true);
+  motorBSetDirection(true);
+  rampTo(0, speed);
+}
+void sharpTurnRight(int speed) {
+  motorASetDirection(true);
+  motorBSetDirection(true);
+  rampTo(speed, 0);
+}
+
+// ---------- High-level routines adapted from provided logic ----------
+void updateDisplay(float speedMPS) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Speed: ");
+  display.print(speedMPS, 2);
+  display.print(" m/s");
+  display.display();
+}
+
+void stopAndIdlePWM() {
+  stopMotors();
+  pwmUpdate();
+}
+
+// Perform a smooth, measured U-turn: pivot until center raw sensors detect the line,
+// if not found, reverse pivot direction for a second attempt.
+void performSmoothUTurn(unsigned long maxMs = JUNCTION_TURN_MAX_DUR) {
+  unsigned long start = millis();
+  int consistentCount = 0;
+  inTurning = true;
+
+  int pivotSpeed = max(30, TURN_SPEED - 16); // moderate pivot speed for accuracy
+  immediatePivotLeft(pivotSpeed);
+
+  // first attempt: left pivot
+  while (millis() - start < maxMs) {
+    pwmUpdate();
+    delay(6);
+    bool rawCenter = (digitalRead(irPins[3]) == HIGH) || (digitalRead(irPins[4]) == HIGH);
+    if (rawCenter) consistentCount++; else consistentCount = 0;
+    if (consistentCount >= 3) break;
+  }
+
+  if (consistentCount < 3) {
+    // second attempt: reverse pivot other direction for half duration
+    unsigned long elapsed = millis() - start;
+    unsigned long remain = (elapsed < maxMs) ? (maxMs - elapsed) : (maxMs / 2);
+    immediatePivotRight(pivotSpeed);
+    unsigned long tstart2 = millis();
+    consistentCount = 0;
+    while (millis() - tstart2 < remain) {
+      pwmUpdate();
+      delay(6);
+      bool rawCenter = (digitalRead(irPins[3]) == HIGH) || (digitalRead(irPins[4]) == HIGH);
+      if (rawCenter) consistentCount++; else consistentCount = 0;
+      if (consistentCount >= 3) break;
+    }
+  }
+
+  // stop and align
+  stopMotors();
+  inTurning = false;
+
+  // a tiny forward nudge to settle on the line
+  if ((digitalRead(irPins[3]) != HIGH) && (digitalRead(irPins[4]) != HIGH)) {
+    moveForward(RECOVERY_FORWARD_SPEED, RECOVERY_FORWARD_SPEED);
+    waitWithPWM(80);
+    stopMotors();
+  }
+}
+
+// Dead End Handling (uses filtered sensors)
+void handleDeadEnd() {
+  Serial.println("Dead end detected! Initiating dead end procedure.");
+
+  // If we have a lastJunction and lastAttemptChoice, mark that trial as failed.
+  if (lastJunctionId != 0 && lastAttemptChoice != 123) {
+    markJunctionBranchFailed(lastJunctionId, lastAttemptChoice);
+  }
+
+  stopMotors();
+  pwmUpdate();
+
+  // Reverse a bit to clear the dead end (smooth ramp)
+  moveBackward(DEAD_END_REVERSE_SPEED, DEAD_END_REVERSE_SPEED);
+  waitWithPWM(DEAD_END_REVERSE_DUR);
+  stopMotors();
+  waitWithPWM(20);
+
+  // Do a smooth U-turn (tries both directions if needed)
+  performSmoothUTurn(JUNCTION_TURN_MAX_DUR);
+
+  // After U-turn, if center sensors not active, do a brief forward nudge
+  bool centerActive = (digitalRead(irPins[3]) == HIGH) || (digitalRead(irPins[4]) == HIGH);
+  if (!centerActive) {
+    moveForward(RECOVERY_FORWARD_SPEED, RECOVERY_FORWARD_SPEED);
+    waitWithPWM(RECOVERY_FORWARD_DUR);
+    stopMotors();
+    waitWithPWM(10);
+  }
+  Serial.println("Dead end recovery complete.");
+}
+
+// Improved turning routine: pivot until the middle sensor(s) are consistently activated.
+// Uses raw quick reads during pivot for immediate stopping.
+void turnUntilLine(int direction, int speed, unsigned long maxDuration) {
+  unsigned long startTime = millis();
+  int consistentCount = 0;
+  inTurning = true;
+
+  // begin immediate pivot (no slow ramp)
+  int pivotSpeed = constrain(speed, 30, MAX_DUTY);
+  if (direction == -1) immediatePivotLeft(pivotSpeed);
+  else                 immediatePivotRight(pivotSpeed);
+
+  // poll raw center sensors quickly (require 3 consecutive raw positives)
+  while (millis() - startTime < maxDuration) {
+    pwmUpdate();
+    delay(5); // quick poll
+
+    bool rawCenter = (digitalRead(irPins[3]) == HIGH) || (digitalRead(irPins[4]) == HIGH);
+    if (rawCenter) consistentCount++;
+    else consistentCount = 0;
+
+    if (consistentCount >= 3) break;
+  }
+
+  // stop immediately after detection
+  stopMotors();
+  inTurning = false;
+}
+
+// Handle a junction using memory: decide which branch to take, record attempt, and execute.
+void handleJunctionWithMemory(uint8_t mask) {
+  // create/refresh memory record for this junction and detect loops
+  markJunctionMemory(mask);
+
+  // choose branch avoiding previous failed ones
+  int choice = chooseBranchForJunction(mask);
+  Serial.print("Junction id=");
+  Serial.print(lastJunctionId);
+  Serial.print(" chosen=");
+  Serial.println(choice);
+
+  // execute exactly as original logic (move forward briefly then pivot if needed)
+  if (choice == -1) {
+    // left
+    moveForward(JUNCTION_SPEED, JUNCTION_SPEED);
+    waitWithPWM(50);
+    turnUntilLine(-1, TURN_SPEED, JUNCTION_TURN_MAX_DUR);
+    return;
+  } else if (choice == 0) {
+    // straight
+    moveForward(JUNCTION_SPEED, JUNCTION_SPEED);
+    waitWithPWM(40);
+    driveStop();
+    return;
+  } else if (choice == 1) {
+    // right
+    moveForward(JUNCTION_SPEED, JUNCTION_SPEED);
+    waitWithPWM(50);
+    turnUntilLine(1, TURN_SPEED, JUNCTION_TURN_MAX_DUR);
+    return;
+  }
+}
+
+// ---------- Setup & Loop ----------
+void setup() {
+  Serial.begin(115200);
+
+  // Motor pins
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH); // enable driver
+
+  // IR sensors: normal INPUT (filtering handles chatter)
+  for (int i = 0; i < 8; ++i) pinMode(irPins[i], INPUT);
+
+  // OLED setup
+  Wire.begin(); // default SDA/SCL on ESP32
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+
+  // init sensor counters to 0
+  for (int i = 0; i < 8; ++i) sensorCounters[i] = 0;
+
+  stopMotors();
+  pwmSliceStart = millis();
+  lastLineTime = millis();
+  currentDutyA = currentDutyB = 0;
+  Serial.println("Ready. Memory-enabled follower - tuned speeds.");
+
+  // gentle ramp to base speed
+  int cur = START_DUTY;
+  motorASetDirection(true); motorBSetDirection(true);
+  while (cur < BASE_DUTY) {
+    setDutyA(cur); setDutyB(cur);
+    pwmUpdate();
+    delay(ACCEL_STEP_DELAY_MS);
+    cur += ACCEL_STEP;
+  }
+  currentDutyA = currentDutyB = BASE_D
